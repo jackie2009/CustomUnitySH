@@ -1,0 +1,180 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+#define   PI  3.1415926
+TextureCube<float4> Input;
+RWTexture2D<float4> Result;
+RWStructuredBuffer<float3> Samples;
+SamplerState _PointClamp;
+int FaceSize;
+int size;
+ 
+ 
+float3 xyz_to_uvw(float3 xyz)
+{
+    // Find which dimension we're pointing at the most
+    float3 absxyz = abs(xyz);
+    int xMoreY = absxyz.x > absxyz.y;
+    int yMoreZ = absxyz.y > absxyz.z;
+    int zMoreX = absxyz.z > absxyz.x;
+    int xMost = (xMoreY) && (!zMoreX);
+    int yMost = (!xMoreY) && (yMoreZ);
+    int zMost = (zMoreX) && (!yMoreZ);
+
+    // Determine which index belongs to each +- dimension
+    // 0: +X; 1: -X; 2: +Y; 3: -Y; 4: +Z; 5: -Z;
+    float xSideIdx = 0 + (xyz.x < 0);
+    float ySideIdx = 2 + (xyz.y < 0);
+    float zSideIdx = 4 + (xyz.z < 0);
+
+    // Composite it all together to get our side
+    float side = xMost * xSideIdx + yMost * ySideIdx + zMost * zSideIdx;
+
+    // Depending on side, we use different components for UV and project to square
+    float3 useComponents = float3(0, 0, 0);
+    if (xMost) useComponents = xyz.yzx;
+    if (yMost) useComponents = xyz.xzy;
+    if (zMost) useComponents = xyz.xyz;
+    float2 uv = useComponents.xy / useComponents.z;
+
+    // Transform uv from [-1,1] to [0,1]
+    uv = uv * 0.5 + float2(0.5, 0.5);
+
+    return float3(uv, side);
+}
+
+void convert_cube_uv_to_xyz(int index, float u, float v, out float x, out float y, out float z)
+{
+    // convert range 0 to 1 to -1 to 1
+    float uc = 2.0f * u - 1.0f;
+    float vc = 2.0f * v - 1.0f;
+   
+    if (index == 0) { x = 1.0f; y = vc; z = -uc; };	// POSITIVE X
+   if (index == 1) { x = -1.0f; y = vc; z = uc;};	// NEGATIVE X
+   if (index == 2) { x = uc; y = 1.0f; z = -vc;};	// POSITIVE Y
+   if (index == 3) { x = uc; y = -1.0f; z = vc;};	// NEGATIVE Y
+   if (index == 4) { x = uc; y = vc; z = 1.0f; };	// POSITIVE Z
+   if (index == 5) { x = -uc; y = vc; z = -1.0f; };	// NEGATIVE Z
+    
+}
+// 伪随机 
+float random (float n) { return frac(sin(n)*1000000); }
+ 
+float3 UVToDir(int index, float2 uv) {
+    float x, y, z;
+    convert_cube_uv_to_xyz(index, uv.x, uv.y, x, y, z);
+    return  normalize(float3(x, y, z));
+}
+[numthreads(8, 8, 1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+       // id.xy是像素索引
+        float2 uv = id.xy / (float)(size - 1);
+        //uv = uv * 2.0 - 1.0;
+        // 用上面讲的uv和方向换算方法，求得采样向量
+        // id.z是面索引
+        float3 coord = UVToDir(id.z, uv);
+       // coord.y *= -1;
+        float3 normal = normalize(coord);
+
+
+      /*  int2 offset = 0;
+
+        if (id.z == 0)offset = int2(2, 1) * size;
+        if (id.z == 1)offset = int2(0, 1) * size;
+        if (id.z == 2)offset = int2(1, 2) * size;
+        if (id.z == 3)offset = int2(1, 0) * size;
+        if (id.z == 4)offset = int2(1, 1) * size;
+        if (id.z == 5)offset = int2(3, 1) * size;
+ 
+        Result[id.xy + offset] = Input.SampleLevel(_PointClamp, normal, 0);*/
+//        return;
+        float3 tangent = float3(0, 1, 0);
+        float upOrDown = dot(normal, tangent);
+
+        if (upOrDown == 1)
+            tangent = float3(1, 0, 0);
+        else if (upOrDown == -1)
+            tangent = float3(-1, 0, 0);
+        else
+            // 其实只要这一步就行，不过要处理法线在世界空间上与(0,1,0)平行的情况
+            tangent = normalize(cross(float3(0, 1, 0), normal));
+
+        float3 binormal = normalize(cross(normal, tangent));
+#if 1
+        float sampleDelta = 0.25/8;
+        int N1 = 0;
+        int N2 = 0;
+    
+        float3 irradiance = float3(0, 0, 0);
+
+        for (float phi = 0.0; phi < 2.0 * PI; phi += sampleDelta)
+        {
+            N2 = 0;
+
+            for (float theta = 0.0; theta < 0.5 * PI; theta += sampleDelta)
+            {
+                // 在切线空间内，法线固定为(0, 1, 0)，然后生成采样向量，再通过TBN矩阵转换为世界空间方向
+                float3 tangentSpaceNormal = float3(sin(theta) * cos(phi), sin(theta) * sin(phi), cos(theta));
+                float3 worldNormal = tangentSpaceNormal.x * tangent + tangentSpaceNormal.y * binormal + tangentSpaceNormal.z * normal;
+                float3 c = Input.SampleLevel(_PointClamp, worldNormal, 0).rgb * cos(theta)*sin(theta);
+                irradiance += c; 
+            
+            
+                N2++;
+            }
+
+            N1++;
+        }
+
+        float weight = PI*PI /  (N1 * N2);
+
+#else
+        int N= 80000;
+        
+        float goldenRatio = (1 + sqrt(5)) / 2;
+        float3 irradiance = 0.0;
+        int count = 0;
+        for (int x = 0; x < N; x++)
+        {
+            float i = (float)x  +0.5+(random(x)*0.5-1)*0.1;
+            float theta = acos(1 - 2 * i / N);
+         
+            float phi = 2 * PI * i / goldenRatio;
+
+            float3 tangentSpaceNormal =   float3(cos(phi) * sin(theta), sin(phi) * sin(theta), cos(theta));
+          //  if (dot(tangentSpaceNormal, float3(0,0,1)) < 0) continue;
+            float3 worldNormal = tangentSpaceNormal.x * tangent + tangentSpaceNormal.y * binormal + tangentSpaceNormal.z * normal;
+          
+         
+           // float3 c = Input.SampleLevel(_PointClamp, worldNormal, 0).rgb   * (cos(theta)+0.05)/(1.05);
+            float3 c = Input.SampleLevel(_PointClamp, worldNormal, 0).rgb   * cos(theta) ;
+          
+                irradiance +=max(0,c);
+             
+              
+         
+        }
+        
+   
+
+        
+
+        float weight =  4*PI/N;
+     
+      
+#endif
+        irradiance *= weight;
+        int2 offset = 0;
+ 
+            if (id.z == 0)offset = int2(2, 1) * size;
+            if (id.z == 1)offset = int2(0, 1) * size;
+            if (id.z == 2)offset = int2(1, 2) * size;
+            if (id.z == 3)offset = int2(1, 0) * size;
+            if (id.z == 4)offset = int2(1, 1) * size;
+            if (id.z == 5)offset = int2(3, 1) * size;
+           // irradiance = Input.SampleLevel(_PointClamp, normal, 0);
+       Result[id.xy+ offset] =   float4(irradiance , 1);// float4(irradiance, 1);
+ 
+        
+       
+}
